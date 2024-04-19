@@ -1,10 +1,12 @@
 # ruff: noqa: SIM117
 import copy
 import glob
+import time
 import os
 from abc import ABC, abstractmethod
+from contextlib import ExitStack, contextmanager
 from typing import (TYPE_CHECKING, Any, Dict, Generator, List, Optional, Tuple,
-                    Type)
+                    Type, ContextManager)
 
 import torch
 from torch import nn
@@ -217,8 +219,11 @@ class DefaultModelLoader(BaseModelLoader):
                    vision_language_config: Optional[VisionLanguageConfig],
                    parallel_config: ParallelConfig,
                    scheduler_config: SchedulerConfig) -> nn.Module:
+        start_time = time.perf_counter()
+        init_contexts = [no_init_weights(_enable=True)]
+        init_contexts.append(init_empty_weights())
         with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
+            with ContextManagers(init_contexts):
                 model = _initialize_model(model_config, self.load_config,
                                           lora_config, vision_language_config)
             model.load_weights(
@@ -228,8 +233,182 @@ class DefaultModelLoader(BaseModelLoader):
                                                model,
                                                "fall_back_to_pt_during_load",
                                                True)), )
-        return model.eval()
+        model.to(device_config.device)
+        end_time = time.perf_counter()
 
+        # Calculate the difference
+        elapsed_time = end_time - start_time
+        print(f"The function took {elapsed_time} seconds to run.")
+        return model.eval()
+    
+@contextmanager
+def init_empty_weights(include_buffers: bool = None):
+    """
+    A context manager under which models are initialized with all parameters on the meta device, therefore creating an
+    empty model. Useful when just initializing the model would blow the available RAM.
+
+    Args:
+        include_buffers (`bool`, *optional*):
+            Whether or not to also put all buffers on the meta device while initializing.
+
+    Example:
+
+    ```python
+    import torch.nn as nn
+    from accelerate import init_empty_weights
+
+    # Initialize a model with 100 billions parameters in no time and without using any RAM.
+    with init_empty_weights():
+        tst = nn.Sequential(*[nn.Linear(10000, 10000) for _ in range(1000)])
+    ```
+
+    <Tip warning={true}>
+
+    Any model created under this context manager has no weights. As such you can't do something like
+    `model.to(some_device)` with it. To load weights inside your empty model, see [`load_checkpoint_and_dispatch`].
+    Make sure to overwrite the default device_map param for [`load_checkpoint_and_dispatch`], otherwise dispatch is not
+    called.
+
+    </Tip>
+    """
+    if include_buffers is None:
+        include_buffers = False
+    with init_on_device(torch.device("meta"), include_buffers=include_buffers) as f:
+        yield f
+
+
+@contextmanager
+def init_on_device(device: torch.device, include_buffers: bool = None):
+    """
+    A context manager under which models are initialized with all parameters on the specified device.
+
+    Args:
+        device (`torch.device`):
+            Device to initialize all parameters on.
+        include_buffers (`bool`, *optional*):
+            Whether or not to also put all buffers on the meta device while initializing.
+
+    Example:
+
+    ```python
+    import torch.nn as nn
+    from accelerate import init_on_device
+
+    with init_on_device(device=torch.device("cuda")):
+        tst = nn.Liner(100, 100)  # on `cuda` device
+    ```
+    """
+    # if include_buffers is None:
+    #     include_buffers = parse_flag_from_env("ACCELERATE_INIT_INCLUDE_BUFFERS", False)
+    include_buffers = False
+
+
+    old_register_parameter = nn.Module.register_parameter
+    if include_buffers:
+        old_register_buffer = nn.Module.register_buffer
+
+    def register_empty_parameter(module, name, param):
+        old_register_parameter(module, name, param)
+        if param is not None:
+            param_cls = type(module._parameters[name])
+            kwargs = module._parameters[name].__dict__
+            kwargs["requires_grad"] = param.requires_grad
+            module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+
+    def register_empty_buffer(module, name, buffer, persistent=True):
+        old_register_buffer(module, name, buffer, persistent=persistent)
+        if buffer is not None:
+            module._buffers[name] = module._buffers[name].to(device)
+
+    # Patch tensor creation
+    if include_buffers:
+        tensor_constructors_to_patch = {
+            torch_function_name: getattr(torch, torch_function_name)
+            for torch_function_name in ["empty", "zeros", "ones", "full"]
+        }
+    else:
+        tensor_constructors_to_patch = {}
+
+    def patch_tensor_constructor(fn):
+        def wrapper(*args, **kwargs):
+            kwargs["device"] = device
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    try:
+        nn.Module.register_parameter = register_empty_parameter
+        if include_buffers:
+            nn.Module.register_buffer = register_empty_buffer
+        for torch_function_name in tensor_constructors_to_patch.keys():
+            setattr(torch, torch_function_name, patch_tensor_constructor(getattr(torch, torch_function_name)))
+        yield
+    finally:
+        nn.Module.register_parameter = old_register_parameter
+        if include_buffers:
+            nn.Module.register_buffer = old_register_buffer
+        for torch_function_name, old_torch_function in tensor_constructors_to_patch.items():
+            setattr(torch, torch_function_name, old_torch_function)
+
+    
+class ContextManagers:
+    """
+    Wrapper for `contextlib.ExitStack` which enters a collection of context managers. Adaptation of `ContextManagers`
+    in the `fastcore` library.
+    """
+
+    def __init__(self, context_managers: List[ContextManager]):
+        self.context_managers = context_managers
+        self.stack = ExitStack()
+
+    def __enter__(self):
+        for context_manager in self.context_managers:
+            self.stack.enter_context(context_manager)
+
+    def __exit__(self, *args, **kwargs):
+        self.stack.__exit__(*args, **kwargs)
+
+
+
+TORCH_INIT_FUNCTIONS = {
+    "uniform_": nn.init.uniform_,
+    "normal_": nn.init.normal_,
+    "trunc_normal_": nn.init.trunc_normal_,
+    "constant_": nn.init.constant_,
+    "xavier_uniform_": nn.init.xavier_uniform_,
+    "xavier_normal_": nn.init.xavier_normal_,
+    "kaiming_uniform_": nn.init.kaiming_uniform_,
+    "kaiming_normal_": nn.init.kaiming_normal_,
+    "uniform": nn.init.uniform,
+    "normal": nn.init.normal,
+    "xavier_uniform": nn.init.xavier_uniform,
+    "xavier_normal": nn.init.xavier_normal,
+    "kaiming_uniform": nn.init.kaiming_uniform,
+    "kaiming_normal": nn.init.kaiming_normal,
+}
+
+@contextmanager
+def no_init_weights(_enable=True):
+    """
+    Context manager to globally disable weight initialization to speed up loading large models.
+
+    """
+
+    if _enable:
+
+        def _skip_init(*args, **kwargs):
+            pass
+
+        # # Save the original initialization functions
+        for name, init_func in TORCH_INIT_FUNCTIONS.items():
+            setattr(torch.nn.init, name, _skip_init)
+    try:
+        yield
+    finally:
+        if _enable:
+            # # Restore the original initialization functions
+            for name, init_func in TORCH_INIT_FUNCTIONS.items():
+                setattr(torch.nn.init, name, init_func)
 
 class DummyModelLoader(BaseModelLoader):
     """Model loader that will set model weights to random values."""

@@ -33,6 +33,7 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.sampler import Sampler
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -286,6 +287,10 @@ class OPTForCausalLM(nn.Module):
         self.linear_method = linear_method
         self.model = OPTModel(config, linear_method)
         self.lm_head_weight = self.model.decoder.embed_tokens.weight
+        set_weight_attrs(self.lm_head_weight, {
+            "parallel_dim": 0,
+            "weight_loader": self.model.decoder.embed_tokens.weight_loader
+        })
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
 
@@ -327,7 +332,7 @@ class OPTForCausalLM(nn.Module):
                 continue
             if name.startswith("decoder."):
                 name = "model." + name
-
+            print(name)
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue

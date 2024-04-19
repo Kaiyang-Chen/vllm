@@ -59,6 +59,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.org_vocab_size = org_num_embeddings or num_embeddings
         self.num_embeddings_padded = pad_vocab_size(num_embeddings,
                                                     padding_size)
+        print("num embedding:", self.num_embeddings)
+        print("num_embeddings_padded:", self.num_embeddings_padded)
         self.embedding_dim = embedding_dim
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -74,10 +76,12 @@ class VocabParallelEmbedding(torch.nn.Module):
             torch.empty(self.num_embeddings_per_partition,
                         self.embedding_dim,
                         dtype=params_dtype))
-        set_weight_attrs(self.weight, {
-            "parallel_dim": 0,
-            "weight_loader": self.weight_loader
-        })
+        print("weight size",  self.weight.size())
+        self.register_parameter("weight",  self.weight)
+        # set_weight_attrs(self.weight, {
+        #     "parallel_dim": 0,
+        #     "weight_loader": self.weight_loader
+        # })
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         parallel_dim = param.parallel_dim
@@ -135,6 +139,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.bias = Parameter(
                 torch.empty(self.num_embeddings_per_partition,
                             dtype=params_dtype))
+            self.register_parameter("bias", self.bias)
             set_weight_attrs(self.bias, {
                 "parallel_dim": 0,
                 "weight_loader": self.weight_loader
