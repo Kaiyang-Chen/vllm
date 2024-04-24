@@ -65,14 +65,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
                        output_size_per_partition: int, input_size: int,
                        output_size: int, params_dtype: torch.dtype,
                        **extra_weight_attrs):
+        # print(layer, extra_weight_attrs)
         weight = Parameter(torch.empty(output_size_per_partition,
                                        input_size_per_partition,
                                        dtype=params_dtype),
                            requires_grad=False)
         
-        layer.register_parameter("weight", weight)
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         set_weight_attrs(weight, extra_weight_attrs)
+        layer.register_parameter("weight", weight)
+        # print("layer weight after set is:", layer.weight.__dict__)
 
     def apply_weights(self,
                       layer: torch.nn.Module,
@@ -125,7 +127,9 @@ class ReplicatedLinear(torch.nn.Module):
         if bias:
             self.bias = Parameter(
                 torch.empty(self.output_size, dtype=self.params_dtype))
-            set_weight_attrs(self.bias, {"output_dim": 0})
+            print("internal is_meta for bias: ", self.bias.is_meta)
+            set_weight_attrs(self.bias, {"output_dim": 0,
+                                         "is_bias": True})
         else:
             self.register_parameter("bias", None)
 
@@ -193,14 +197,17 @@ class ColumnParallelLinear(torch.nn.Module):
             self.bias = Parameter(
                 torch.empty(self.output_size_per_partition,
                             dtype=params_dtype))
+            print("dict for bias: ", self.bias.__dict__)
             set_weight_attrs(self.bias, {
                 "output_dim": 0,
                 "weight_loader": self.weight_loader,
+                "is_bias": True,
             })
         else:
             self.register_parameter("bias", None)
 
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(self, params_dict: dict[str, Parameter], tensor_name: str, loaded_weight: torch.Tensor):
+        param = params_dict[tensor_name]
         tp_rank = get_tensor_model_parallel_rank()
         output_dim = getattr(param, "output_dim", None)
         param_data = param.data
@@ -210,7 +217,12 @@ class ColumnParallelLinear(torch.nn.Module):
             loaded_weight = loaded_weight.narrow(output_dim, start_idx,
                                                  shard_size)
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        with torch.no_grad():
+            param_cls = type(param)
+            new_value = param_cls(loaded_weight, requires_grad=param.requires_grad).to("cpu")
+            params_dict[tensor_name] = new_value
+        # param_data.copy_(loaded_weight)
+
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
@@ -264,9 +276,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                          skip_bias_add, params_dtype, linear_method)
 
     def weight_loader(self,
-                      param: Parameter,
+                      params_dict: dict[str, Parameter], 
+                      tensor_name: str,
                       loaded_weight: torch.Tensor,
                       loaded_shard_id: Optional[int] = None):
+        param = params_dict[tensor_name]
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
         if loaded_shard_id is None:
@@ -329,7 +343,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     "MergedColumnParallelLinear, assume the weight is "
                     "the same for all partitions.")
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        with torch.no_grad():
+            param_cls = type(param)
+            new_value = param_cls(loaded_weight, requires_grad=param.requires_grad).to("cpu")
+            params_dict[tensor_name] = new_value
+        # param_data.copy_(loaded_weight)
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -390,17 +408,22 @@ class QKVParallelLinear(ColumnParallelLinear):
                          params_dtype, linear_method)
 
     def weight_loader(self,
-                      param: Parameter,
+                      params_dict: dict[str, Parameter], 
+                      tensor_name: str,
                       loaded_weight: torch.Tensor,
                       loaded_shard_id: Optional[str] = None):
-        param_data = param.data
-        output_dim = getattr(param, "output_dim", None)
-
+        param = params_dict[tensor_name]
+        param_data = params_dict[tensor_name].data
+        output_dim = getattr(params_dict[tensor_name], "output_dim", None)
         if loaded_shard_id is None:
             # Loaded weight is already packed.
             if output_dim is None:
                 assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                with torch.no_grad():
+                    param_cls = type(param)
+                    new_value = param_cls(loaded_weight, requires_grad=param.requires_grad).to("cpu")
+                    params_dict[tensor_name] = new_value
+                # param_data.copy_(loaded_weight)
                 return
             shard_offsets = [
                 # (shard_id, shard_offset, shard_size)
@@ -425,43 +448,60 @@ class QKVParallelLinear(ColumnParallelLinear):
 
                 loaded_weight_shard = loaded_weight.narrow(
                     output_dim, shard_offset, shard_size)
-                self.weight_loader(param, loaded_weight_shard, shard_id)
+                self.weight_loader(params_dict, tensor_name, loaded_weight_shard, shard_id)
             return
-
+        
         tp_rank = get_tensor_model_parallel_rank()
         assert loaded_shard_id in ["q", "k", "v"]
         if output_dim is not None:
-            if loaded_shard_id == "q":
-                shard_offset = 0
-                shard_size = self.num_heads * self.head_size
-            elif loaded_shard_id == "k":
-                shard_offset = self.num_heads * self.head_size
-                shard_size = self.num_kv_heads * self.head_size
-            elif loaded_shard_id == "v":
-                shard_offset = (self.num_heads +
-                                self.num_kv_heads) * self.head_size
-                shard_size = self.num_kv_heads * self.head_size
+            # if loaded_shard_id == "q":
+            #     shard_offset = 0
+            #     shard_size = self.num_heads * self.head_size
+            # elif loaded_shard_id == "k":
+            #     shard_offset = self.num_heads * self.head_size
+            #     shard_size = self.num_kv_heads * self.head_size
+            # elif loaded_shard_id == "v":
+            #     shard_offset = (self.num_heads +
+            #                     self.num_kv_heads) * self.head_size
+            #     shard_size = self.num_kv_heads * self.head_size
             # If quantized, we need to adjust the offset and size to account
             # for the packing.
-            packed_dim = getattr(param, "packed_dim", None)
-            if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
+            # packed_dim = getattr(param, "packed_dim", None)
+            # if packed_dim == output_dim:
+            #     shard_size = shard_size // param.pack_factor
+            #     shard_offset = shard_offset // param.pack_factor
 
-                # If marlin, we need to adjust the offset and size to
-                # account for the tiling.
-                shard_size, shard_offset = adjust_marlin_shard(
-                    param, shard_size, shard_offset)
+            #     # If marlin, we need to adjust the offset and size to
+            #     # account for the tiling.
+            #     shard_size, shard_offset = adjust_marlin_shard(
+            #         param, shard_size, shard_offset)
 
-            param_data = param_data.narrow(output_dim, shard_offset,
-                                           shard_size)
-            if loaded_shard_id == "q":
-                shard_id = tp_rank
-            else:
-                shard_id = tp_rank // self.num_kv_head_replicas
-            start_idx = shard_id * shard_size
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx,
-                                                 shard_size)
+            # param_data = param_data.narrow(output_dim, shard_offset,
+            #                                shard_size)
+            # if loaded_shard_id == "q":
+            #     shard_id = tp_rank
+            # else:
+            #     shard_id = tp_rank // self.num_kv_head_replicas
+            # start_idx = shard_id * shard_size
+            # loaded_weight = loaded_weight.narrow(output_dim, start_idx,
+            #                                      shard_size)
+            # with torch.no_grad():
+            #     param_cls = type(param)
+            #     new_value = param_cls(loaded_weight, requires_grad=param.requires_grad).to("cpu")
+            #     # Create a list of slices for all dimensions. Start with slice(None) which is equivalent to ':'
+            #     index_slices = [slice(None)] * params_dict[tensor_name].dim()
+            #     # Modify the slice for the dimension we want to narrow.
+            #     index_slices[output_dim] = slice(shard_offset, shard_offset + shard_size)
+            #     # Convert list of slices to a tuple and use it to index the tensor.
+            #     params_dict[tensor_name].data[tuple(index_slices)] = new_value
+            #     print("internal is_meta after load weight: ", params_dict[tensor_name].data[tuple(index_slices)].is_meta)
+
+            # return
+            with torch.no_grad():
+                param_cls = type(param)
+                new_value = param_cls(loaded_weight, requires_grad=param.requires_grad).to("cpu")
+                params_dict[tensor_name] = new_value
+            return
         else:
             ignore_warning = getattr(param, "ignore_warning", False)
             if not ignore_warning:
@@ -469,8 +509,15 @@ class QKVParallelLinear(ColumnParallelLinear):
                     "Loading a weight without `output_dim` attribute in "
                     "QKVParallelLinear, assume the weight is the same "
                     "for all partitions.")
+
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        print("function called here")
+        with torch.no_grad():
+            param_cls = type(param)
+            new_value = param_cls(loaded_weight, requires_grad=param.requires_grad).to("cpu")
+            params_dict[tensor_name] = new_value
+
+        # param_data.copy_(loaded_weight)
 
 
 class RowParallelLinear(torch.nn.Module):
@@ -545,11 +592,13 @@ class RowParallelLinear(torch.nn.Module):
             set_weight_attrs(self.bias, {
                 "output_dim": 0,
                 "weight_loader": self.weight_loader,
+                "is_bias": True, 
             })
         else:
             self.register_parameter("bias", None)
 
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(self, params_dict: dict[str, Parameter], tensor_name: str, loaded_weight: torch.Tensor):
+        param = params_dict[tensor_name]
         tp_rank = get_tensor_model_parallel_rank()
         input_dim = getattr(param, "input_dim", None)
         param_data = param.data
@@ -559,7 +608,11 @@ class RowParallelLinear(torch.nn.Module):
             loaded_weight = loaded_weight.narrow(input_dim, start_idx,
                                                  shard_size)
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        with torch.no_grad():
+            param_cls = type(param)
+            new_value = param_cls(loaded_weight, requires_grad=param.requires_grad).to("cpu")
+            params_dict[tensor_name] = new_value
+        # param_data.copy_(loaded_weight)
 
     def forward(self, input_):
         # Set up backprop all-reduce.

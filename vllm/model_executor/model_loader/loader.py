@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from contextlib import ExitStack, contextmanager
 from typing import (TYPE_CHECKING, Any, Dict, Generator, List, Optional, Tuple,
                     Type, ContextManager)
-
+# from accelerate import init_empty_weights
 import torch
 from torch import nn
 
@@ -25,6 +25,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     get_quant_config, initialize_dummy_weights, np_cache_weights_iterator,
     pt_weights_iterator, safetensors_weights_iterator)
 from vllm.model_executor.models.llava import LlavaForConditionalGeneration
+from vllm.model_executor.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.linear import LinearMethodBase
@@ -224,6 +225,7 @@ class DefaultModelLoader(BaseModelLoader):
         init_contexts.append(init_empty_weights())
         with set_default_torch_dtype(model_config.dtype):
             with ContextManagers(init_contexts):
+            # with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config,
                                           lora_config, vision_language_config)
             model.load_weights(
@@ -311,9 +313,16 @@ def init_on_device(device: torch.device, include_buffers: bool = None):
         old_register_parameter(module, name, param)
         if param is not None:
             param_cls = type(module._parameters[name])
-            kwargs = module._parameters[name].__dict__
+            extra_weight_attrs = module._parameters[name].__dict__
+            kwargs = {}
             kwargs["requires_grad"] = param.requires_grad
-            module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+            if "is_bias" in extra_weight_attrs.keys() and extra_weight_attrs["is_bias"]:
+                module._parameters[name] = param_cls(module._parameters[name], **kwargs).to("cpu")
+                print("is_meta for bias: ", module._parameters[name].is_meta)
+            else:
+                module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+            ## TODO: 把其他内容作为extra拿出来 在这边set attr 就不需要改原来的顺序了
+            set_weight_attrs(module._parameters[name], extra_weight_attrs)
 
     def register_empty_buffer(module, name, buffer, persistent=True):
         old_register_buffer(module, name, buffer, persistent=persistent)

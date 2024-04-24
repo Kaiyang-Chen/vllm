@@ -60,7 +60,7 @@ class OPTAttention(nn.Module):
         self,
         embed_dim: int,
         num_heads: int,
-        bias: bool = True,
+        bias: bool = False,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
@@ -286,11 +286,11 @@ class OPTForCausalLM(nn.Module):
         self.config = config
         self.linear_method = linear_method
         self.model = OPTModel(config, linear_method)
-        self.lm_head_weight = self.model.decoder.embed_tokens.weight
-        set_weight_attrs(self.lm_head_weight, {
-            "parallel_dim": 0,
-            "weight_loader": self.model.decoder.embed_tokens.weight_loader
-        })
+        self.lm_head_weight = nn.Parameter(self.model.decoder.embed_tokens.weight)
+        # set_weight_attrs(self.lm_head_weight, {
+        #     "parallel_dim": 0,
+        #     "weight_loader": self.model.decoder.embed_tokens.weight_loader
+        # })
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
 
@@ -327,28 +327,52 @@ class OPTForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        qkv_shard_ids = []
         for name, loaded_weight in weights:
             if "lm_head.weight" in name:
                 continue
             if name.startswith("decoder."):
                 name = "model." + name
-            print(name)
+            # print(name)
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
+                # Here we simply assume weights is in sequence of model structure
+                if shard_id not in qkv_shard_ids:
+                    qkv_shard_ids.append(shard_id)
+                    if len(qkv_shard_ids) < 3:
+                        break
+
+                name = name.replace(weight_name, param_name)
+                # We only load model weight when we have all the qkv proj ready,
+                # and load them together at once
+                # print(name)
                 param = params_dict[name]
+                # print("addr before load weight: ", params_dict[name].data_ptr())
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                # The shard_id is actually dummy here
+                weight_loader(params_dict, name, loaded_weight, shard_id)
+                # print("addr after load weight: ", params_dict[name].data_ptr())
+                # print("is_meta after load weight: ", params_dict[name].is_meta)
+                qkv_shard_ids.clear()
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
+                # print("addr before load weight: ", params_dict[name].data_ptr())
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
-                weight_loader(param, loaded_weight)
+                # weight_loader(param, loaded_weight)
+                weight_loader(params_dict, name, loaded_weight)
+                # print("addr after load weight: ", params_dict[name].data_ptr())
+                # print("is_meta after load weight: ", params_dict[name].is_meta)
+
+            # print(params_dict[name])
+            for name in params_dict.keys():
+                print(name, "is meta: ", params_dict[name].is_meta)

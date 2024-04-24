@@ -12,6 +12,7 @@ import filelock
 import huggingface_hub.constants
 import numpy as np
 import torch
+from torch.nn.parameter import Parameter
 from huggingface_hub import HfFileSystem, snapshot_download
 from safetensors.torch import load_file, safe_open, save_file
 from tqdm.auto import tqdm
@@ -332,13 +333,17 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     return x
 
 
-def default_weight_loader(param: torch.Tensor,
+def default_weight_loader(params_dict: dict[str, Parameter], 
+                          tensor_name: str,
                           loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
-    print("param size:", param.size())
-    print("loaded_weight size:", loaded_weight.size())
-    assert param.size() == loaded_weight.size()
-    param.data.copy_(loaded_weight)
+    assert params_dict[tensor_name].size() == loaded_weight.size()
+    with torch.no_grad():
+        param_cls = type(params_dict[tensor_name])
+        new_value = param_cls(loaded_weight, requires_grad=params_dict[tensor_name].requires_grad).to("cpu")
+        params_dict[tensor_name] = new_value
+    # param.data.copy_(loaded_weight)
+
 
 
 def initialize_dummy_weights(

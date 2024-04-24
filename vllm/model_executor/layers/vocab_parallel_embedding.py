@@ -1,6 +1,7 @@
 from typing import Optional, Sequence
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
@@ -59,8 +60,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.org_vocab_size = org_num_embeddings or num_embeddings
         self.num_embeddings_padded = pad_vocab_size(num_embeddings,
                                                     padding_size)
-        print("num embedding:", self.num_embeddings)
-        print("num_embeddings_padded:", self.num_embeddings_padded)
         self.embedding_dim = embedding_dim
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -76,19 +75,28 @@ class VocabParallelEmbedding(torch.nn.Module):
             torch.empty(self.num_embeddings_per_partition,
                         self.embedding_dim,
                         dtype=params_dtype))
-        print("weight size",  self.weight.size())
-        self.register_parameter("weight",  self.weight)
-        # set_weight_attrs(self.weight, {
-        #     "parallel_dim": 0,
-        #     "weight_loader": self.weight_loader
-        # })
+        set_weight_attrs(self.weight, {
+            "parallel_dim": 0,
+            "weight_loader": self.weight_loader
+        })
 
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        parallel_dim = param.parallel_dim
+        self.register_parameter("weight",  self.weight)
+
+
+    def weight_loader(self, params_dict: dict[str, Parameter], tensor_name: str, loaded_weight: torch.Tensor):
+        parallel_dim = params_dict[tensor_name].parallel_dim
         assert loaded_weight.shape[parallel_dim] == self.org_vocab_size
         loaded_weight = loaded_weight[self.vocab_start_index:self.
                                       vocab_end_index]
-        param[:loaded_weight.shape[0]].data.copy_(loaded_weight)
+        # param[:loaded_weight.shape[0]].data.copy_(loaded_weight)
+        with torch.no_grad():
+            param_cls = type(params_dict[tensor_name])
+            new_value = param_cls(loaded_weight, requires_grad=params_dict[tensor_name].requires_grad).to("cpu")
+            print("value addr : ", new_value.data_ptr())
+            # param[:loaded_weight.shape[0]] = new_value
+            params_dict[tensor_name][:loaded_weight.shape[0]] = new_value
+            # print("new_value after called:", new_value)
+            # print("param after called:", param)
 
     def forward(self, input_):
         if self.tp_size > 1:
@@ -139,11 +147,11 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.bias = Parameter(
                 torch.empty(self.num_embeddings_per_partition,
                             dtype=params_dtype))
-            self.register_parameter("bias", self.bias)
             set_weight_attrs(self.bias, {
                 "parallel_dim": 0,
                 "weight_loader": self.weight_loader
-            })
+            })                
+            # self.register_parameter("bias", self.bias)
         else:
             self.register_parameter("bias", None)
 
